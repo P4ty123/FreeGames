@@ -10,8 +10,13 @@ FONTI = {
     "DODI (repack)": "dodi-repacks.site",
     "CS.RIN.RU (crack)": "cs.rin.ru",
     "RuTracker": "rutracker.org",
+    "The Pirate Bay": "thepiratebay.org",
+    "Cracked-Games (rischioso)": "cracked-games.org",
     "Steam (titolo)": "store.steampowered.com",
 }
+
+# Fonti che compaiono nella finestra ma partono disattivate (spuntale a mano)
+DISATTIVATE = {"Cracked-Games (rischioso)"}
 
 def scarica(url, timeout=15):
     req = urllib.request.Request(url, headers={"User-Agent": UA})
@@ -107,12 +112,13 @@ class App:
         opz = ttk.Frame(root, padding=(10, 0))
         opz.pack(fill="x")
         self.vars = {}
-        for nome in FONTI:
-            v = tk.BooleanVar(value=True)
+        for i, nome in enumerate(FONTI):
+            v = tk.BooleanVar(value=nome not in DISATTIVATE)
             self.vars[nome] = v
-            ttk.Checkbutton(opz, text=nome, variable=v).pack(side="left", padx=(0, 8))
+            ttk.Checkbutton(opz, text=nome, variable=v).grid(row=i // 4, column=i % 4, sticky="w", padx=(0, 12), pady=1)
         self.ita = tk.BooleanVar(value=False)
-        ttk.Checkbutton(opz, text="Aggiungi 'ita'", variable=self.ita).pack(side="left")
+        n = len(FONTI)
+        ttk.Checkbutton(opz, text="Aggiungi 'ita'", variable=self.ita).grid(row=n // 4, column=n % 4, sticky="w", pady=1)
         vt = ttk.Frame(root, padding=10)
         vt.pack(fill="x")
         ttk.Label(vt, text="Chiave VirusTotal (opzionale):").pack(side="left")
