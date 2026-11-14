@@ -24,7 +24,7 @@ from pathlib import Path
 from faster_whisper import WhisperModel
 from ollama import Client
 
-from PySide6.QtGui import QPixmap, QPainter, QPen, QColor
+from PySide6.QtGui import QPixmap, QPainter, QPen, QColor, QTextCursor
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps, ImageDraw
 
 
@@ -226,6 +226,18 @@ MODELS = {
 }
 
 DEFAULT_MODE = "🧠 Normale"
+
+# Quanto tempo Ollama tiene il modello in memoria dopo l'ultima risposta.
+# Più lungo = niente ricaricamento (lento) se fai domande a distanza di minuti.
+CHAT_KEEP_ALIVE = "30m"
+
+
+def strip_thinking(text):
+    """Toglie l'eventuale ragionamento <think>...</think> di qwen3."""
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.S)
+    if "<think>" in text:  # ragionamento ancora in corso
+        text = text.split("<think>", 1)[0]
+    return text.lstrip()
 
 
 # ============================================================
@@ -2419,6 +2431,8 @@ class AIWorker(QObject):
 
     finished = Signal(str)
     error = Signal(str)
+    # Testo parziale mentre il modello scrive (per mostrarlo in tempo reale).
+    partial = Signal(str)
 
     def __init__(
         self,
@@ -2521,11 +2535,12 @@ class AIWorker(QObject):
                 "model": self.model,
                 "messages": messages,
                 "options": {"num_ctx": self.context},
-                "keep_alive": "5m",
+                "keep_alive": CHAT_KEEP_ALIVE,
                 "stream": True,
             }
             answer_parts = []
             stream_error = None
+            last_partial = 0.0
 
             try:
                 try:
@@ -2561,6 +2576,10 @@ class AIWorker(QObject):
                     if not delta:
                         continue
                     answer_parts.append(delta)
+                    now = time.monotonic()
+                    if now - last_partial >= 0.05:
+                        last_partial = now
+                        self.partial.emit(strip_thinking("".join(answer_parts)))
             except Exception as exc:
                 stream_error = exc
 
@@ -2603,7 +2622,7 @@ class AIWorker(QObject):
                 self.finished.emit("")
                 return
 
-            self.finished.emit("".join(answer_parts).strip())
+            self.finished.emit(strip_thinking("".join(answer_parts)).strip())
 
         except Exception as exc:
 
@@ -6188,10 +6207,10 @@ class JarvisWindow(QWidget):
 
         self._set_request_controls_enabled(False)
 
-        self.chat.append(
-            "<b>JARVIS:</b> "
-            "Sto elaborando..."
-        )
+        # Riga "JARVIS: ..." che viene riempita mentre il modello scrive.
+        self.chat.append("<b>JARVIS:</b> ")
+        self._stream_start = self.chat.document().characterCount() - 1
+        self._set_stream_text("…")
 
         self.history.append(
             {
@@ -6228,6 +6247,10 @@ class JarvisWindow(QWidget):
 
         self.current_worker.finished.connect(
             self.on_response
+        )
+
+        self.current_worker.partial.connect(
+            self._set_stream_text
         )
 
         self.current_worker.error.connect(
@@ -6268,11 +6291,27 @@ class JarvisWindow(QWidget):
             self.history[-12:]
         )
 
-        self.chat.append(
-            f"<b>JARVIS:</b> {answer}"
-        )
+        self._set_stream_text(answer or "(nessuna risposta)")
+        self._stream_start = None
 
         self._set_request_controls_enabled(True)
+
+    def _set_stream_text(self, text):
+        """Sostituisce il testo della risposta in corso nella chat."""
+        start = getattr(self, "_stream_start", None)
+        if start is None:
+            return
+        bar = self.chat.verticalScrollBar()
+        at_bottom = bar.value() >= bar.maximum() - 4
+        cursor = QTextCursor(self.chat.document())
+        cursor.setPosition(start)
+        cursor.movePosition(
+            QTextCursor.MoveOperation.End,
+            QTextCursor.MoveMode.KeepAnchor,
+        )
+        cursor.insertText(text or "…")
+        if at_bottom:
+            bar.setValue(bar.maximum())
 
     # ========================================================
     # ERROR
@@ -6286,6 +6325,7 @@ class JarvisWindow(QWidget):
 
         detail = str(_error_message or "Errore sconosciuto")
         print("[JARVIS - ERRORE OLLAMA]", detail, file=sys.stderr)
+        self._stream_start = None
 
         self.chat.append(
             "<b>JARVIS:</b> Non sono riuscito a completare "
