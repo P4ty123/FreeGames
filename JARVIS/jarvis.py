@@ -1,4 +1,4 @@
-# JARVIS 6.2 - ASSISTENTE AI LOCALE (chat, memoria, conoscenza e allegati)
+# JARVIS 6.3 - ASSISTENTE AI LOCALE (chat, memoria, conoscenza e allegati)
 # Derivato dalla 5.5.24: rimossi voce live, comandi vocali, TTS,
 # comandi sul PC e modalita' gioco automatica.
 
@@ -212,13 +212,13 @@ client = Client(host=OLLAMA_HOST)
 # ============================================================
 
 # Unico modello usato per la chat.
-CHAT_MODEL = "qwen2.5-coder:14b"
+CHAT_MODEL = "jarvis:latest"
 CHAT_CONTEXT = 4096
 
 
 def chat_think_kwargs(model):
     """Il parametro think esiste solo per i modelli con ragionamento (qwen3).
-    Ad altri modelli, come qwen2.5-coder, non va passato."""
+    Ad altri modelli, come jarvis:latest, non va passato."""
     return {"think": False} if str(model).startswith("qwen3") else {}
 
 # Quanto tempo Ollama tiene il modello in memoria dopo l'ultima risposta.
