@@ -1,0 +1,8 @@
+PySide6
+ollama
+pillow
+faster-whisper
+av
+pypdf
+python-docx
+openpyxl

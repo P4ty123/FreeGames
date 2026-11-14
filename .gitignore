@@ -1,0 +1,13 @@
+# File generati da Python
+__pycache__/
+*.pyc
+
+# Dati personali e file prodotti da JARVIS (restano solo sul tuo PC)
+JARVIS/memory.json
+JARVIS/edited_files/
+JARVIS/media_outputs/
+
+# Build dell'eseguibile
+build/
+dist/
+*.spec.bak
