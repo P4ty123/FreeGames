@@ -1,4 +1,4 @@
-# JARVIS 6.0 - ASSISTENTE AI LOCALE (solo chat, memoria e allegati)
+# JARVIS 6.1 - ASSISTENTE AI LOCALE (chat, memoria, conoscenza e allegati)
 # Derivato dalla 5.5.24: rimossi voce live, comandi vocali, TTS,
 # comandi sul PC e modalita' gioco automatica.
 
@@ -15,6 +15,9 @@ import mimetypes
 import uuid
 import math
 import tempfile
+from html import escape as html_escape
+import sqlite3
+from contextlib import closing
 from urllib.parse import urlencode
 from urllib import request as urllib_request
 from urllib import error as urllib_error
@@ -48,6 +51,8 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QPlainTextEdit,
+    QCheckBox,
     QListWidget,
     QListWidgetItem,
     QMessageBox,
@@ -2441,9 +2446,12 @@ class AIWorker(QObject):
         model,
         mode_name,
         context,
+        use_knowledge=False,
     ):
 
         super().__init__()
+
+        self.use_knowledge = use_knowledge
 
         self.message = message
         self.history = history
@@ -2509,6 +2517,21 @@ class AIWorker(QObject):
                 memory_block
             )
 
+            num_ctx = self.context
+            self.knowledge_sources = []
+            if self.use_knowledge:
+                try:
+                    results = KNOWLEDGE.search(self.message)
+                except Exception as exc:
+                    print("[JARVIS - CONOSCENZA]", exc, file=sys.stderr)
+                    results = []
+                if results:
+                    system_prompt += build_knowledge_block(results)
+                    num_ctx = max(num_ctx, KNOWLEDGE_MIN_CONTEXT)
+                    self.knowledge_sources = list(
+                        dict.fromkeys(title for title, _ in results)
+                    )
+
             messages = [
                 {
                     "role": "system",
@@ -2534,7 +2557,7 @@ class AIWorker(QObject):
             kwargs = {
                 "model": self.model,
                 "messages": messages,
-                "options": {"num_ctx": self.context},
+                "options": {"num_ctx": num_ctx},
                 "keep_alive": CHAT_KEEP_ALIVE,
                 "stream": True,
             }
@@ -4103,6 +4126,575 @@ class VisionAnalysisWorker(QObject):
 
 
 # ============================================================
+# CONOSCENZA (RAG LOCALE): TESTI INCOLLATI O FILE IMPORTATI
+# ============================================================
+#
+# I testi vengono divisi in pezzi e salvati in knowledge/knowledge.sqlite
+# accanto al programma. Per ogni domanda la ricerca combina:
+#   - parole esatte (SQLite FTS5 / BM25): nomi, numeri, termini precisi;
+#   - significato (embedding di Ollama, modello KNOWLEDGE_EMBED_MODEL).
+# I due elenchi vengono fusi (Reciprocal Rank Fusion) e solo i pezzi
+# migliori vengono passati al modello, così resta rapido anche con
+# moltissimo testo.
+
+KNOWLEDGE_DIR = BASE_DIR / "knowledge"
+KNOWLEDGE_DB = KNOWLEDGE_DIR / "knowledge.sqlite"
+KNOWLEDGE_EMBED_MODEL = "bge-m3"
+KNOWLEDGE_CHUNK_CHARS = 1000
+KNOWLEDGE_CHUNK_OVERLAP = 150
+KNOWLEDGE_EMBED_BATCH = 32
+KNOWLEDGE_TOP_K = 6
+KNOWLEDGE_MAX_CHARS = 9000
+# Con la conoscenza attiva serve più contesto per far stare gli estratti.
+KNOWLEDGE_MIN_CONTEXT = 8192
+
+_KNOWLEDGE_STOPWORDS = set(
+    "il lo la i gli le un uno una di a da in con su per tra fra e o ma se "
+    "che chi cosa come quando dove perche perché non piu più del dello della "
+    "dei degli delle al allo alla ai agli alle dal dallo dalla dai dagli dalle "
+    "nel nello nella nei negli nelle sul sullo sulla sui sugli sulle è sono "
+    "ho hai ha abbiamo avete hanno mi ti si ci vi questo questa quello quella "
+    "mio mia tuo tua suo sua cosa qual quale quali quanto quanti me te lui lei "
+    "noi voi loro anche ancora gia già poi molto poco tutto tutti fare fa".split()
+)
+
+
+def _knowledge_connect():
+    KNOWLEDGE_DIR.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(KNOWLEDGE_DB), timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS docs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            sha TEXT UNIQUE NOT NULL,
+            chars INTEGER NOT NULL,
+            created REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS chunks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            doc_id INTEGER NOT NULL REFERENCES docs(id) ON DELETE CASCADE,
+            ord INTEGER NOT NULL,
+            text TEXT NOT NULL,
+            emb BLOB
+        );
+        CREATE INDEX IF NOT EXISTS chunks_doc ON chunks(doc_id);
+        CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+            text, content='chunks', content_rowid='id',
+            tokenize='unicode61 remove_diacritics 2'
+        );
+        CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON chunks BEGIN
+            INSERT INTO chunks_fts(rowid, text) VALUES (new.id, new.text);
+        END;
+        CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON chunks BEGIN
+            INSERT INTO chunks_fts(chunks_fts, rowid, text)
+            VALUES ('delete', old.id, old.text);
+        END;
+        """
+    )
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+def split_knowledge_text(text):
+    """Divide un testo lungo in pezzi di ~KNOWLEDGE_CHUNK_CHARS caratteri,
+    rispettando paragrafi e frasi e ripetendo l'ultimo titolo incontrato
+    in testa al pezzo, così ogni pezzo resta comprensibile da solo."""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+    pieces = []
+    for para in paragraphs:
+        if len(para) <= KNOWLEDGE_CHUNK_CHARS:
+            pieces.append(para)
+            continue
+        sentences = re.split(r"(?<=[.!?;:])\s+|\n", para)
+        buf = ""
+        for sent in sentences:
+            while len(sent) > KNOWLEDGE_CHUNK_CHARS:
+                pieces.append(sent[:KNOWLEDGE_CHUNK_CHARS])
+                sent = sent[KNOWLEDGE_CHUNK_CHARS - KNOWLEDGE_CHUNK_OVERLAP:]
+            if buf and len(buf) + len(sent) + 1 > KNOWLEDGE_CHUNK_CHARS:
+                pieces.append(buf)
+                buf = buf[-KNOWLEDGE_CHUNK_OVERLAP:].split(" ", 1)[-1] + " " + sent
+            else:
+                buf = (buf + " " + sent).strip()
+        if buf:
+            pieces.append(buf)
+
+    chunks = []
+    current = ""
+    heading = ""
+    for piece in pieces:
+        first_line = piece.split("\n", 1)[0].strip()
+        looks_heading = (
+            len(piece) < 120
+            and "\n" not in piece
+            and not first_line.endswith((".", ",", ";"))
+        )
+        if looks_heading:
+            heading = first_line.lstrip("#").strip()
+        if current and len(current) + len(piece) + 2 > KNOWLEDGE_CHUNK_CHARS:
+            chunks.append(current)
+            current = (f"[{heading}] " if heading and not looks_heading else "") + piece
+        else:
+            current = (current + "\n\n" + piece).strip()
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _ollama_embed(texts, on_gpu=True):
+    """Restituisce una matrice numpy normalizzata (una riga per testo)."""
+    import numpy as np
+
+    options = {} if on_gpu else {"num_gpu": 0}
+    response = client.embed(
+        model=KNOWLEDGE_EMBED_MODEL,
+        input=list(texts),
+        options=options,
+        keep_alive="30m" if not on_gpu else "1m",
+    )
+    vectors = (
+        response.get("embeddings")
+        if isinstance(response, dict)
+        else getattr(response, "embeddings", None)
+    )
+    if not vectors:
+        raise RuntimeError("Ollama non ha restituito embedding.")
+    matrix = np.asarray(vectors, dtype=np.float32)
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    return matrix / norms
+
+
+class KnowledgeBase:
+    """Accesso all'indice della conoscenza. Thread-safe: ogni operazione
+    apre la propria connessione; la matrice degli embedding è in cache."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._cache_key = None
+        self._ids = None
+        self._matrix = None
+        self.embed_warning = None
+
+    # ---------------------------------------------------- contenuti
+    def stats(self):
+        try:
+            with closing(_knowledge_connect()) as conn:
+                docs = conn.execute("SELECT COUNT(*) FROM docs").fetchone()[0]
+                chunks = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+                missing = conn.execute(
+                    "SELECT COUNT(*) FROM chunks WHERE emb IS NULL"
+                ).fetchone()[0]
+            return docs, chunks, missing
+        except Exception:
+            return 0, 0, 0
+
+    def list_docs(self):
+        with closing(_knowledge_connect()) as conn:
+            return conn.execute(
+                "SELECT d.id, d.title, d.chars, COUNT(c.id) FROM docs d "
+                "LEFT JOIN chunks c ON c.doc_id = d.id "
+                "GROUP BY d.id ORDER BY d.created DESC"
+            ).fetchall()
+
+    def delete_doc(self, doc_id):
+        with closing(_knowledge_connect()) as conn:
+            conn.execute("DELETE FROM chunks WHERE doc_id = ?", (doc_id,))
+            conn.execute("DELETE FROM docs WHERE id = ?", (doc_id,))
+            conn.commit()
+        self._invalidate()
+
+    def add_document(self, title, text, progress=None, cancel_event=None):
+        """Aggiunge un testo. Ritorna (doc_id, numero_pezzi, avviso)."""
+        import hashlib
+
+        text = (text or "").strip()
+        if not text:
+            raise ValueError("Il testo è vuoto.")
+        sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        chunks = split_knowledge_text(text)
+        with closing(_knowledge_connect()) as conn:
+            if conn.execute("SELECT 1 FROM docs WHERE sha = ?", (sha,)).fetchone():
+                raise ValueError("Questo testo è già nella conoscenza.")
+            cur = conn.execute(
+                "INSERT INTO docs(title, sha, chars, created) VALUES (?,?,?,?)",
+                (title.strip() or "Senza titolo", sha, len(text), time.time()),
+            )
+            doc_id = cur.lastrowid
+            conn.executemany(
+                "INSERT INTO chunks(doc_id, ord, text) VALUES (?,?,?)",
+                [(doc_id, i, c) for i, c in enumerate(chunks)],
+            )
+            conn.commit()
+        self._invalidate()
+        warning = self.embed_missing(progress=progress, cancel_event=cancel_event)
+        return doc_id, len(chunks), warning
+
+    def embed_missing(self, progress=None, cancel_event=None):
+        """Calcola gli embedding dei pezzi che non li hanno ancora.
+        Se il modello non c'è, la ricerca per parole esatte funziona lo stesso."""
+        with closing(_knowledge_connect()) as conn:
+            todo = conn.execute(
+                "SELECT id, text FROM chunks WHERE emb IS NULL ORDER BY id"
+            ).fetchall()
+        total = len(todo)
+        if not total:
+            return None
+        done = 0
+        try:
+            for start in range(0, total, KNOWLEDGE_EMBED_BATCH):
+                if cancel_event is not None and cancel_event.is_set():
+                    break
+                batch = todo[start:start + KNOWLEDGE_EMBED_BATCH]
+                matrix = _ollama_embed([t for _, t in batch], on_gpu=True)
+                with closing(_knowledge_connect()) as conn:
+                    conn.executemany(
+                        "UPDATE chunks SET emb = ? WHERE id = ?",
+                        [(matrix[i].tobytes(), cid) for i, (cid, _) in enumerate(batch)],
+                    )
+                    conn.commit()
+                done += len(batch)
+                if progress:
+                    progress(done, total)
+        except Exception as exc:
+            self.embed_warning = (
+                f"Ricerca per significato non disponibile ({exc}). "
+                f"Scarica il modello con: ollama pull {KNOWLEDGE_EMBED_MODEL}. "
+                "Intanto uso la ricerca per parole esatte."
+            )
+            return self.embed_warning
+        finally:
+            self._invalidate()
+        self.embed_warning = None
+        return None
+
+    # ---------------------------------------------------- ricerca
+    def _invalidate(self):
+        with self._lock:
+            self._cache_key = None
+
+    def _load_vectors(self):
+        import numpy as np
+
+        with self._lock:
+            with closing(_knowledge_connect()) as conn:
+                key = conn.execute(
+                    "SELECT COUNT(*), COALESCE(MAX(id),0) FROM chunks WHERE emb IS NOT NULL"
+                ).fetchone()
+                if key == self._cache_key and self._matrix is not None:
+                    return self._ids, self._matrix
+                rows = conn.execute(
+                    "SELECT id, emb FROM chunks WHERE emb IS NOT NULL"
+                ).fetchall()
+            if rows:
+                self._ids = np.array([r[0] for r in rows], dtype=np.int64)
+                self._matrix = np.vstack(
+                    [np.frombuffer(r[1], dtype=np.float32) for r in rows]
+                )
+            else:
+                self._ids, self._matrix = None, None
+            self._cache_key = key
+            return self._ids, self._matrix
+
+    @staticmethod
+    def _fts_query(question):
+        words = re.findall(r"\w+", normalize_text(question))
+        terms = [w for w in words if len(w) > 2 and w not in _KNOWLEDGE_STOPWORDS]
+        if not terms:
+            terms = [w for w in words if len(w) > 1]
+        terms = list(dict.fromkeys(terms))[:24]
+        return " OR ".join(f'"{t}"*' for t in terms)
+
+    def search(self, question, top_k=KNOWLEDGE_TOP_K, max_chars=KNOWLEDGE_MAX_CHARS):
+        """Ritorna una lista di (titolo, testo) dei pezzi più pertinenti."""
+        import numpy as np
+
+        ranked = {}
+        query = self._fts_query(question)
+        with closing(_knowledge_connect()) as conn:
+            if query:
+                try:
+                    hits = conn.execute(
+                        "SELECT rowid FROM chunks_fts WHERE chunks_fts MATCH ? "
+                        "ORDER BY bm25(chunks_fts) LIMIT 30",
+                        (query,),
+                    ).fetchall()
+                except sqlite3.OperationalError:
+                    hits = []
+                for rank, (cid,) in enumerate(hits):
+                    ranked[cid] = ranked.get(cid, 0.0) + 1.0 / (60 + rank)
+
+        ids, matrix = self._load_vectors()
+        if matrix is not None:
+            try:
+                qvec = _ollama_embed([question], on_gpu=False)[0]
+                scores = matrix @ qvec
+                best = np.argsort(-scores)[:30]
+                for rank, idx in enumerate(best):
+                    cid = int(ids[idx])
+                    ranked[cid] = ranked.get(cid, 0.0) + 1.0 / (60 + rank)
+            except Exception as exc:
+                self.embed_warning = str(exc)
+
+        if not ranked:
+            return []
+        order = sorted(ranked, key=lambda c: -ranked[c])[: top_k * 2]
+        with closing(_knowledge_connect()) as conn:
+            marks = ",".join("?" * len(order))
+            rows = {
+                r[0]: (r[1], r[2])
+                for r in conn.execute(
+                    f"SELECT c.id, d.title, c.text FROM chunks c "
+                    f"JOIN docs d ON d.id = c.doc_id WHERE c.id IN ({marks})",
+                    order,
+                )
+            }
+        results, used = [], 0
+        for cid in order:
+            if cid not in rows:
+                continue
+            title, text = rows[cid]
+            if used + len(text) > max_chars and results:
+                break
+            results.append((title, text))
+            used += len(text)
+            if len(results) >= top_k:
+                break
+        return results
+
+
+KNOWLEDGE = KnowledgeBase()
+
+
+def read_knowledge_file(path):
+    """Legge un file intero (senza il limite di caratteri degli allegati)."""
+    file_path = Path(path)
+    readers = {
+        ".txt": _read_plain_text_attachment,
+        ".md": _read_plain_text_attachment,
+        ".pdf": _read_pdf_attachment,
+        ".docx": _read_docx_attachment,
+        ".csv": _read_csv_attachment,
+        ".xlsx": _read_xlsx_attachment,
+    }
+    reader = readers.get(file_path.suffix.lower())
+    if reader is None:
+        raise RuntimeError("formato non supportato")
+    text, _note = reader(file_path)
+    return _clean_document_text(text)
+
+
+def build_knowledge_block(results):
+    if not results:
+        return ""
+    parts = [
+        "\n\nCONOSCENZA (estratti dai testi che l'utente ti ha dato):",
+    ]
+    for i, (title, text) in enumerate(results, 1):
+        parts.append(f"\n[{i}] Da «{title}»:\n{text}")
+    parts.append(
+        "\n\nRegole per la conoscenza: se la risposta è negli estratti, "
+        "basati su di essi con precisione (numeri, nomi e passaggi esatti) "
+        "e indica tra parentesi quadre il numero dell'estratto usato, es. [2]. "
+        "Se gli estratti non contengono la risposta, dillo chiaramente "
+        "invece di inventare."
+    )
+    return "\n".join(parts)
+
+
+class KnowledgeIndexWorker(QObject):
+    progress = Signal(int, int)
+    finished = Signal(str)
+    error = Signal(str)
+
+    def __init__(self, items):
+        super().__init__()
+        self.items = items  # lista di (titolo, testo)
+        self.cancel_event = threading.Event()
+
+    @Slot()
+    def process(self):
+        added, skipped, warning = 0, [], None
+        try:
+            for title, text in self.items:
+                try:
+                    _, n, warn = KNOWLEDGE.add_document(
+                        title, text,
+                        progress=lambda d, t: self.progress.emit(d, t),
+                        cancel_event=self.cancel_event,
+                    )
+                    added += n
+                    warning = warn or warning
+                except ValueError as exc:
+                    skipped.append(f"{title}: {exc}")
+            msg = f"Aggiunti {added} pezzi alla conoscenza."
+            if skipped:
+                msg += " Saltati: " + "; ".join(skipped)
+            if warning:
+                msg += "\n\n" + warning
+            self.finished.emit(msg)
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
+class KnowledgeDialog(QDialog):
+    """Finestra per incollare testi, importare file e gestire la conoscenza."""
+
+    changed = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("📚 Conoscenza di JARVIS")
+        self.resize(900, 720)
+        self.thread = None
+        self.worker = None
+
+        self.title_edit = QLineEdit()
+        self.title_edit.setPlaceholderText("Titolo (es. «Manuale officina», «Regole del gioco»)")
+        self.text_edit = QPlainTextEdit()
+        self.text_edit.setPlaceholderText(
+            "Incolla qui il testo, anche molto lungo, poi premi «Aggiungi alla conoscenza»."
+        )
+        self.count_label = QLabel("0 caratteri")
+        self.text_edit.textChanged.connect(
+            lambda: self.count_label.setText(
+                f"{len(self.text_edit.toPlainText()):,} caratteri".replace(",", ".")
+            )
+        )
+        self.add_button = QPushButton("➕ Aggiungi alla conoscenza")
+        self.import_button = QPushButton("📂 Importa file…")
+        self.reindex_button = QPushButton("🔄 Completa indice")
+        self.reindex_button.setToolTip(
+            "Calcola la ricerca per significato per i testi che non l'hanno ancora "
+            f"(serve il modello Ollama {KNOWLEDGE_EMBED_MODEL})."
+        )
+        self.status = QLabel("")
+        self.status.setWordWrap(True)
+
+        self.doc_list = QListWidget()
+        self.delete_button = QPushButton("🗑 Elimina selezionato")
+
+        top = QHBoxLayout()
+        top.addWidget(self.add_button)
+        top.addWidget(self.import_button)
+        top.addWidget(self.reindex_button)
+        top.addStretch()
+        top.addWidget(self.count_label)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.title_edit)
+        layout.addWidget(self.text_edit, 3)
+        layout.addLayout(top)
+        layout.addWidget(self.status)
+        layout.addWidget(QLabel("<b>Testi già imparati</b>"))
+        layout.addWidget(self.doc_list, 2)
+        layout.addWidget(self.delete_button)
+
+        self.add_button.clicked.connect(self.add_pasted)
+        self.import_button.clicked.connect(self.import_files)
+        self.reindex_button.clicked.connect(lambda: self._start([]))
+        self.delete_button.clicked.connect(self.delete_selected)
+        self.refresh()
+
+    def refresh(self):
+        self.doc_list.clear()
+        try:
+            for doc_id, title, chars, n in KNOWLEDGE.list_docs():
+                item = QListWidgetItem(f"{title}  —  {chars:,} caratteri, {n} pezzi".replace(",", "."))
+                item.setData(Qt.ItemDataRole.UserRole, doc_id)
+                self.doc_list.addItem(item)
+        except Exception as exc:
+            self.status.setText(f"Errore nel leggere la conoscenza: {exc}")
+        docs, chunks, missing = KNOWLEDGE.stats()
+        self.reindex_button.setEnabled(missing > 0 and self.thread is None)
+
+    def _busy(self, busy):
+        for w in (self.add_button, self.import_button, self.delete_button, self.reindex_button):
+            w.setEnabled(not busy)
+
+    def add_pasted(self):
+        text = self.text_edit.toPlainText().strip()
+        if not text:
+            self.status.setText("Incolla prima un testo.")
+            return
+        title = self.title_edit.text().strip() or text.split("\n", 1)[0][:60]
+        self._start([(title, text)])
+
+    def import_files(self):
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Importa file nella conoscenza", "",
+            "Documenti (*.txt *.md *.pdf *.docx *.csv *.xlsx)",
+        )
+        items = []
+        for p in paths:
+            try:
+                text = read_knowledge_file(p)
+                if text:
+                    items.append((Path(p).name, str(text)))
+            except Exception as exc:
+                self.status.setText(f"Non riesco a leggere {Path(p).name}: {exc}")
+        if items:
+            self._start(items)
+
+    def _start(self, items):
+        if self.thread is not None:
+            return
+        self._busy(True)
+        self.status.setText("Indicizzo… (i testi molto lunghi richiedono qualche minuto la prima volta)")
+        self.thread = QThread()
+        self.worker = KnowledgeIndexWorker(items)
+        self.worker.moveToThread(self.thread)
+        self.thread.started.connect(self.worker.process)
+        self.worker.progress.connect(
+            lambda d, t: self.status.setText(f"Indicizzo per significato: {d}/{t} pezzi…")
+        )
+        self.worker.finished.connect(self._done)
+        self.worker.error.connect(lambda e: self._done("Errore: " + e))
+        self.worker.finished.connect(self.thread.quit)
+        self.worker.error.connect(self.thread.quit)
+        self.thread.finished.connect(self._cleanup)
+        self.thread.start()
+
+    def _done(self, message):
+        self.status.setText(message)
+        if not message.startswith("Errore"):
+            self.text_edit.clear()
+            self.title_edit.clear()
+        self.changed.emit()
+
+    def _cleanup(self):
+        if self.worker:
+            self.worker.deleteLater()
+        if self.thread:
+            self.thread.deleteLater()
+        self.worker = self.thread = None
+        self._busy(False)
+        self.refresh()
+
+    def delete_selected(self):
+        item = self.doc_list.currentItem()
+        if not item:
+            return
+        if QMessageBox.question(self, "Elimina", f"Eliminare «{item.text()}» dalla conoscenza?") \
+                != QMessageBox.StandardButton.Yes:
+            return
+        KNOWLEDGE.delete_doc(item.data(Qt.ItemDataRole.UserRole))
+        self.refresh()
+        self.changed.emit()
+
+    def closeEvent(self, event):
+        if self.worker is not None:
+            self.worker.cancel_event.set()
+        if self.thread is not None:
+            self.thread.quit()
+            self.thread.wait(3000)
+        event.accept()
+
+
+# ============================================================
 # FINESTRA PRINCIPALE
 # ============================================================
 
@@ -4457,7 +5049,7 @@ class JarvisWindow(QWidget):
                 font-family: Segoe UI;
             }
 
-            QTextEdit {
+            QTextEdit, QPlainTextEdit {
                 background: #0f172a;
                 color: white;
                 border: 1px solid #1e293b;
@@ -4574,6 +5166,19 @@ class JarvisWindow(QWidget):
             self.mode_selector
         )
 
+        self.mode_selector.setMinimumWidth(170)
+
+        self.knowledge_button = QPushButton("📚 Conoscenza")
+        self.knowledge_button.setToolTip(
+            "Incolla testi o importa file: JARVIS li userà per rispondere."
+        )
+        self.knowledge_button.clicked.connect(self.open_knowledge)
+        mode_layout.addWidget(self.knowledge_button)
+
+        self.knowledge_toggle = QCheckBox("Usa la conoscenza")
+        self.knowledge_toggle.setChecked(True)
+        mode_layout.addWidget(self.knowledge_toggle)
+
 
         mode_layout.addStretch()
 
@@ -4613,6 +5218,11 @@ class JarvisWindow(QWidget):
         layout.addWidget(
             self.memory_info
         )
+
+        self.knowledge_info = QLabel()
+        self.knowledge_info.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.knowledge_info)
+        self.update_knowledge_info()
 
 
         self.setLayout(
@@ -5907,6 +6517,19 @@ class JarvisWindow(QWidget):
         )
 
 
+    def update_knowledge_info(self):
+        docs, chunks, missing = KNOWLEDGE.stats()
+        text = f"📚 Conoscenza: {docs} testi, {chunks} pezzi"
+        if missing:
+            text += f" ({missing} senza ricerca per significato)"
+        self.knowledge_info.setText(text)
+
+    def open_knowledge(self):
+        dialog = KnowledgeDialog(self)
+        dialog.changed.connect(self.update_knowledge_info)
+        dialog.exec()
+        self.update_knowledge_info()
+
     def update_memory_info(self):
 
         self.memory_info.setText(
@@ -6235,6 +6858,7 @@ class JarvisWindow(QWidget):
             self.current_model,
             self.current_mode,
             self.current_context,
+            use_knowledge=self.knowledge_toggle.isChecked(),
         )
 
         self.current_worker.moveToThread(
@@ -6293,6 +6917,14 @@ class JarvisWindow(QWidget):
 
         self._set_stream_text(answer or "(nessuna risposta)")
         self._stream_start = None
+
+        sources = getattr(self.current_worker, "knowledge_sources", None)
+        if sources:
+            self.chat.append(
+                "<span style='color:#94a3b8'>📚 Fonti: "
+                + ", ".join(html_escape(t) for t in sources)
+                + "</span>"
+            )
 
         self._set_request_controls_enabled(True)
 

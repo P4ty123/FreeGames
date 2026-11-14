@@ -11,3 +11,4 @@ JARVIS/media_outputs/
 build/
 dist/
 *.spec.bak
+JARVIS/knowledge/
