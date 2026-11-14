@@ -55,12 +55,12 @@ jobs:
         if: github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: jarvis-v6.1.${{ github.run_number }}
-          name: JARVIS 6.1 (build ${{ github.run_number }})
+          tag_name: jarvis-v6.2.${{ github.run_number }}
+          name: JARVIS 6.2 (build ${{ github.run_number }})
           make_latest: "true"
           body: |
             JARVIS, assistente AI locale (chat, memoria, conoscenza, allegati).
             Requisiti: Ollama installato e avviato, con i modelli scaricati
-            (`ollama pull qwen3:14b` e, per la Conoscenza, `ollama pull bge-m3`).
+            (`ollama pull qwen2.5-coder:14b` e, per la Conoscenza, `ollama pull bge-m3`).
             Commit: ${{ github.sha }}
           files: JARVIS/dist/JARVIS.exe

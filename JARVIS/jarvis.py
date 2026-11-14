@@ -1,4 +1,4 @@
-# JARVIS 6.1 - ASSISTENTE AI LOCALE (chat, memoria, conoscenza e allegati)
+# JARVIS 6.2 - ASSISTENTE AI LOCALE (chat, memoria, conoscenza e allegati)
 # Derivato dalla 5.5.24: rimossi voce live, comandi vocali, TTS,
 # comandi sul PC e modalita' gioco automatica.
 
@@ -43,7 +43,6 @@ from PySide6.QtCore import (
 
 from PySide6.QtWidgets import (
     QApplication,
-    QComboBox,
     QDialog,
     QFileDialog,
     QGroupBox,
@@ -212,25 +211,15 @@ client = Client(host=OLLAMA_HOST)
 # MODELLI
 # ============================================================
 
-MODELS = {
-    "🧠 Normale": {
-        "model": "qwen3:14b",
-        "profile": "Qualità massima",
-        "context": 4096,
-    },
-    "⚡ Veloce": {
-        "model": "qwen3:1.7b",
-        "profile": "Più rapido, usa meno memoria video",
-        "context": 2048,
-    },
-    "🪶 Leggero": {
-        "model": "qwen3:0.6b",
-        "profile": "Per PC poco potenti",
-        "context": 1024,
-    },
-}
+# Unico modello usato per la chat.
+CHAT_MODEL = "qwen2.5-coder:14b"
+CHAT_CONTEXT = 4096
 
-DEFAULT_MODE = "🧠 Normale"
+
+def chat_think_kwargs(model):
+    """Il parametro think esiste solo per i modelli con ragionamento (qwen3).
+    Ad altri modelli, come qwen2.5-coder, non va passato."""
+    return {"think": False} if str(model).startswith("qwen3") else {}
 
 # Quanto tempo Ollama tiene il modello in memoria dopo l'ultima risposta.
 # Più lungo = niente ricaricamento (lento) se fai domande a distanza di minuti.
@@ -2508,11 +2497,6 @@ class AIWorker(QObject):
                 "Non inventare informazioni: se non sai qualcosa, dillo. "
             )
 
-            if self.mode_name == "⚡ Veloce":
-                system_prompt += " Mantieni le risposte brevi."
-            elif self.mode_name == "🪶 Leggero":
-                system_prompt += " Usa risposte molto brevi."
-
             system_prompt += (
                 memory_block
             )
@@ -2567,7 +2551,7 @@ class AIWorker(QObject):
 
             try:
                 try:
-                    response_stream = client.chat(think=False, **kwargs)
+                    response_stream = client.chat(**chat_think_kwargs(self.model), **kwargs)
                 except Exception as exc:
                     # Compatibilità con versioni precedenti del client o
                     # del server, che rifiutano il parametro 'think'.
@@ -3427,7 +3411,7 @@ class MediaAnalysisWorker(QObject):
             "keep_alive": "5m",
         }
         try:
-            response = client.chat(think=False, **kwargs)
+            response = client.chat(**chat_think_kwargs(kwargs.get("model", "")), **kwargs)
         except TypeError:
             response = client.chat(**kwargs)
         return str(response.get("message", {}).get("content", "") or "").strip()
@@ -3468,7 +3452,7 @@ class MediaAnalysisWorker(QObject):
             "keep_alive": VISION_KEEP_ALIVE,
         }
         try:
-            response = client.chat(think=False, **kwargs)
+            response = client.chat(**chat_think_kwargs(kwargs.get("model", "")), **kwargs)
         except TypeError:
             response = client.chat(**kwargs)
         return str(response.get("message", {}).get("content", "") or "").strip()
@@ -4066,7 +4050,7 @@ class VisionAnalysisWorker(QObject):
                 # disabilitarlo evita casi in cui il budget di token viene
                 # consumato dal ragionamento e message.content resta vuoto.
                 try:
-                    return client.chat(think=False, **kwargs)
+                    return client.chat(**chat_think_kwargs(kwargs.get("model", "")), **kwargs)
                 except TypeError:
                     # Compatibilità con versioni meno recenti della libreria
                     # Python di Ollama che non espongono ancora `think`.
@@ -4717,17 +4701,9 @@ class JarvisWindow(QWidget):
         # AI STATE
         # ====================================================
 
-        self.current_mode = (
-            DEFAULT_MODE
-        )
-
-        self.current_model = MODELS[
-            self.current_mode
-        ]["model"]
-
-        self.current_context = MODELS[
-            self.current_mode
-        ]["context"]
+        self.current_mode = ""
+        self.current_model = CHAT_MODEL
+        self.current_context = CHAT_CONTEXT
 
         self.history = []
 
@@ -4954,26 +4930,6 @@ class JarvisWindow(QWidget):
         )
 
         # ----------------------------------------------------
-        # MODE
-        # ----------------------------------------------------
-
-        mode_label = QLabel(
-            "MODALITÀ:"
-        )
-
-        self.mode_selector = QComboBox()
-
-        self.mode_selector.addItems(
-            list(
-                MODELS.keys()
-            )
-        )
-
-        self.mode_selector.setCurrentText(
-            self.current_mode
-        )
-
-        # ----------------------------------------------------
         # STATUS
         # ----------------------------------------------------
 
@@ -5001,9 +4957,6 @@ class JarvisWindow(QWidget):
             self.send_message
         )
 
-        self.mode_selector.currentTextChanged.connect(
-            self.manual_mode_change
-        )
 
         self.load_attachment_button.clicked.connect(
             self.load_attachments
@@ -5157,16 +5110,6 @@ class JarvisWindow(QWidget):
         )
 
         mode_layout = QHBoxLayout()
-
-        mode_layout.addWidget(
-            mode_label
-        )
-
-        mode_layout.addWidget(
-            self.mode_selector
-        )
-
-        self.mode_selector.setMinimumWidth(170)
 
         self.knowledge_button = QPushButton("📚 Conoscenza")
         self.knowledge_button.setToolTip(
@@ -6503,17 +6446,8 @@ class JarvisWindow(QWidget):
 
     def update_mode_status(self):
 
-        info = MODELS[
-            self.current_mode
-        ]
-
         self.mode_status.setText(
-            f"<b>MODALITÀ:</b> "
-            f"{self.current_mode} | "
-            f"<b>MODELLO:</b> "
-            f"{info['model']} | "
-            f"<b>PROFILO:</b> "
-            f"{info['profile']}"
+            f"<b>MODELLO:</b> {self.current_model}"
         )
 
 
@@ -6539,54 +6473,6 @@ class JarvisWindow(QWidget):
 
     # ========================================================
     # MANUAL MODE
-    # ========================================================
-
-    def manual_mode_change(
-        self,
-        new_mode,
-    ):
-
-        if (
-            new_mode
-            == self.current_mode
-        ):
-
-            return
-
-        if self.current_thread:
-
-            self.mode_selector.blockSignals(
-                True
-            )
-
-            self.mode_selector.setCurrentText(
-                self.current_mode
-            )
-
-            self.mode_selector.blockSignals(
-                False
-            )
-
-            return
-
-        stop_model(
-            self.current_model
-        )
-
-        self.current_mode = new_mode
-
-        self.current_model = MODELS[
-            new_mode
-        ]["model"]
-
-        self.current_context = MODELS[
-            new_mode
-        ]["context"]
-
-        self.update_mode_status()
-
-    # ========================================================
-    # LEARNING
     # ========================================================
 
     def learn_message(
@@ -6748,7 +6634,6 @@ class JarvisWindow(QWidget):
     def _set_request_controls_enabled(self, enabled):
         self.input_box.setEnabled(enabled)
         self.send_button.setEnabled(enabled)
-        self.mode_selector.setEnabled(enabled)
 
         if enabled:
             self.input_box.setFocus()
