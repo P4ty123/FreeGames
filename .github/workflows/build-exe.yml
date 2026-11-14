@@ -8,6 +8,9 @@ on:
       - "JARVIS/requirements.txt"
       - ".github/workflows/build-exe.yml"
 
+permissions:
+  contents: write   # serve per pubblicare la Release
+
 jobs:
   build:
     runs-on: windows-latest
@@ -46,3 +49,18 @@ jobs:
           name: JARVIS-exe
           path: JARVIS/dist/JARVIS.exe
           retention-days: 30
+
+      # Solo sul branch main: pubblica l'exe come Release con un link fisso.
+      - name: Pubblica la Release
+        if: github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: jarvis-v6.0.${{ github.run_number }}
+          name: JARVIS 6.0 (build ${{ github.run_number }})
+          make_latest: "true"
+          body: |
+            JARVIS, assistente AI locale (chat, memoria, allegati).
+            Requisiti: Ollama installato e avviato, con i modelli scaricati
+            (es. `ollama pull qwen3:14b`).
+            Commit: ${{ github.sha }}
+          files: JARVIS/dist/JARVIS.exe
